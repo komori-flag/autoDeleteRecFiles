@@ -1,0 +1,23 @@
+{
+  "name": "auto-delete-rec-files",
+  "version": "1.0.0",
+  "description": "自动检测磁盘空间并删除旧录制文件",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "disk-space",
+    "auto-delete",
+    "cron"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "node-cron": "^3.0.2",
+    "nodemailer": "^6.9.7",
+    "check-disk-space": "^3.4.0",
+    "fs-extra": "^11.1.1"
+  }
+}
