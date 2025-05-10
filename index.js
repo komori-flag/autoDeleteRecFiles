@@ -18,25 +18,33 @@ const {
   cronSchedule,
   minFreeSpaceGB,
   bufferPercentage,
-  recordingsPath,
+  recordingsPaths,
   deleteDelay
 } = config;
+
+async function main() {
+  const promises = [];
+  for (const recordingsPath of recordingsPaths) {
+    promises.push(checkDiskSpace(recordingsPath));
+  }
+
+  await Promise.all(promises);
+}
 
 /**
  * 主要检查流程
  */
-async function checkDiskSpace() {
+async function checkDiskSpace(recordingsPath = '') {
   try {
-    console.log('开始检查磁盘空间...');
-    
+    console.log(`开始检查 ${recordingsPath} 的磁盘空间...`);
     // 获取磁盘空间信息
     const spaceInfo = await diskManager.getDiskSpace(recordingsPath);
     console.log(`总空间: ${spaceInfo.totalGB.toFixed(2)}GB, 剩余空间: ${spaceInfo.freeGB.toFixed(2)}GB`);
-    
+
     // 检查是否低于阈值
     if (spaceInfo.freeGB < minFreeSpaceGB) {
       console.log(`警告: 剩余空间 ${spaceInfo.freeGB.toFixed(2)}GB 低于阈值 ${minFreeSpaceGB}GB`);
-      
+
       // 获取要删除的目录列表
       const dirsToDelete = await fileManager.getDirectoriesToDelete(
         recordingsPath,
@@ -44,31 +52,31 @@ async function checkDiskSpace() {
         minFreeSpaceGB,
         bufferPercentage
       );
-      
+
       if (dirsToDelete.length === 0) {
         console.log('没有找到可删除的目录');
         return;
       }
-      
+
       // 计算可释放的空间
       const totalSizeToFree = dirsToDelete.reduce((total, dir) => total + dir.sizeGB, 0);
       console.log(`将删除 ${dirsToDelete.length} 个目录，预计释放 ${totalSizeToFree.toFixed(2)}GB 空间`);
-      
+
       // 发送邮件通知
       const emailContent = emailSender.prepareDeleteEmail(dirsToDelete, spaceInfo, minFreeSpaceGB, deleteDelay);
       await emailSender.sendEmail('磁盘空间不足警告', emailContent);
       console.log(`已发送邮件通知，将在 ${deleteDelay} 小时后执行删除操作`);
-      
+
       // 设置定时删除
       setTimeout(async () => {
         console.log('开始执行删除操作...');
         await fileManager.deleteDirectories(dirsToDelete);
         console.log('删除操作完成');
-        
+
         // 重新检查空间
         const newSpaceInfo = await diskManager.getDiskSpace(recordingsPath);
         console.log(`删除后剩余空间: ${newSpaceInfo.freeGB.toFixed(2)}GB`);
-        
+
         // 发送删除完成的邮件
         const completionEmailContent = emailSender.prepareCompletionEmail(dirsToDelete, newSpaceInfo);
         await emailSender.sendEmail('自动删除完成通知', completionEmailContent);
@@ -85,10 +93,10 @@ async function checkDiskSpace() {
 
 // 启动定时任务
 console.log(`启动定时任务，调度: ${cronSchedule}`);
-cron.schedule(cronSchedule, checkDiskSpace);
+cron.schedule(cronSchedule, main);
 
 // 立即执行一次检查
 console.log('立即执行一次磁盘空间检查...');
-checkDiskSpace();
+main();
 
 console.log('自动删除录制文件服务已启动');
