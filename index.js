@@ -7,6 +7,7 @@
  */
 
 const cron = require('node-cron');
+const path = require('path');
 const config = require('./config');
 const diskManager = require('./lib/diskManager');
 const emailSender = require('./lib/emailSender');
@@ -22,72 +23,140 @@ const {
   deleteDelay
 } = config;
 
+let isDeletionScheduled = false; // Flag to prevent concurrent runs
+
 async function main() {
-  const promises = [];
-  for (const recordingsPath of recordingsPaths) {
-    promises.push(checkDiskSpace(recordingsPath));
+  if (isDeletionScheduled) {
+    console.log('已有删除任务在计划中，本次检查跳过');
+    return;
   }
 
-  await Promise.all(promises);
-}
+  const results = [];
+  const diskCache = new Map(); // Cache for disk space info
 
-/**
- * 主要检查流程
- */
-async function checkDiskSpace(recordingsPath = '') {
-  try {
-    console.log(`开始检查 ${recordingsPath} 的磁盘空间...`);
-    // 获取磁盘空间信息
-    const spaceInfo = await diskManager.getDiskSpace(recordingsPath);
-    console.log(`总空间: ${spaceInfo.totalGB.toFixed(2)}GB, 剩余空间: ${spaceInfo.freeGB.toFixed(2)}GB`);
+  for (const recordingsPath of recordingsPaths) {
+    const diskRoot = path.parse(recordingsPath).root;
+    let spaceInfo;
 
-    // 检查是否低于阈值
-    if (spaceInfo.freeGB < minFreeSpaceGB) {
-      console.log(`警告: 剩余空间 ${spaceInfo.freeGB.toFixed(2)}GB 低于阈值 ${minFreeSpaceGB}GB`);
-
-      // 获取要删除的目录列表
-      const dirsToDelete = await fileManager.getDirectoriesToDelete(
-        recordingsPath,
-        spaceInfo.freeGB,
-        minFreeSpaceGB,
-        bufferPercentage
-      );
-
-      if (dirsToDelete.length === 0) {
-        console.log('没有找到可删除的目录');
-        return;
-      }
-
-      // 计算可释放的空间
-      const totalSizeToFree = dirsToDelete.reduce((total, dir) => total + dir.sizeGB, 0);
-      console.log(`将删除 ${dirsToDelete.length} 个目录，预计释放 ${totalSizeToFree.toFixed(2)}GB 空间`);
-
-      // 发送邮件通知
-      const emailContent = emailSender.prepareDeleteEmail(dirsToDelete, spaceInfo, minFreeSpaceGB, deleteDelay);
-      await emailSender.sendEmail('磁盘空间不足警告', emailContent);
-      console.log(`已发送邮件通知，将在 ${deleteDelay} 小时后执行删除操作`);
-
-      // 设置定时删除
-      setTimeout(async () => {
-        console.log('开始执行删除操作...');
-        await fileManager.deleteDirectories(dirsToDelete);
-        console.log('删除操作完成');
-
-        // 重新检查空间
-        const newSpaceInfo = await diskManager.getDiskSpace(recordingsPath);
-        console.log(`删除后剩余空间: ${newSpaceInfo.freeGB.toFixed(2)}GB`);
-
-        // 发送删除完成的邮件
-        const completionEmailContent = emailSender.prepareCompletionEmail(dirsToDelete, newSpaceInfo);
-        await emailSender.sendEmail('自动删除完成通知', completionEmailContent);
-      }, deleteDelay * 60 * 60 * 1000); // 转换为毫秒
+    if (diskCache.has(diskRoot)) {
+      spaceInfo = diskCache.get(diskRoot);
+      console.log(`使用磁盘 ${diskRoot} 的缓存空间信息进行检查: ${recordingsPath}`);
     } else {
-      console.log('磁盘空间充足，无需操作');
+      try {
+        console.log(`首次检查磁盘 ${diskRoot} 的空间...`);
+        spaceInfo = await diskManager.getDiskSpace(recordingsPath);
+        diskCache.set(diskRoot, spaceInfo);
+      } catch (error) {
+        console.error(`检查磁盘 ${diskRoot} 空间时出错:`, handleError(error).errMsg);
+        await emailSender.sendEmail(`磁盘空间检查错误 (${diskRoot})`, `检查 ${diskRoot} 磁盘空间时发生错误: ${handleError(error).errMsg}`);
+        continue; // Skip to next path
+      }
     }
-  } catch (error) {
-    console.error('检查磁盘空间时出错:', handleError(error).errMsg);
-    // 发送错误通知邮件
-    await emailSender.sendEmail('磁盘空间检查错误', `检查磁盘空间时发生错误: ${handleError(error).errMsg}`);
+
+    try {
+      if (spaceInfo.freeGB < minFreeSpaceGB) {
+        console.log(`警告: 路径 ${recordingsPath} 所在磁盘剩余空间 ${spaceInfo.freeGB.toFixed(2)}GB 低于阈值 ${minFreeSpaceGB}GB`);
+
+        const dirsToDelete = await fileManager.getDirectoriesToDelete(
+          recordingsPath,
+          spaceInfo.freeGB,
+          minFreeSpaceGB,
+          bufferPercentage
+        );
+
+        results.push({ recordingsPath, spaceInfo, dirsToDelete });
+
+        if (dirsToDelete.length > 0) {
+          const totalSizeToFree = dirsToDelete.reduce((total, dir) => total + dir.sizeGB, 0);
+          console.log(`${recordingsPath}: 将删除 ${dirsToDelete.length} 个目录，预计释放 ${totalSizeToFree.toFixed(2)}GB 空间`);
+        } else {
+          console.log(`${recordingsPath}: 空间不足，但没有找到可删除的目录`);
+        }
+      } else {
+        console.log(`路径 ${recordingsPath} 所在磁盘空间充足，无需操作`);
+      }
+    } catch (error) {
+      console.error(`处理路径 ${recordingsPath} 时出错:`, handleError(error).errMsg);
+      await emailSender.sendEmail(`路径处理错误 (${recordingsPath})`, `处理 ${recordingsPath} 时发生错误: ${handleError(error).errMsg}`);
+    }
+  }
+
+  const triggeredResults = results.filter(result => result && result.dirsToDelete.length > 0);
+
+  if (triggeredResults.length > 0) {
+    console.log(`检测到 ${triggeredResults.length} 个路径需要处理空间不足问题`);
+
+    const dirsByDisk = new Map();
+    for (const result of triggeredResults) {
+      const diskRoot = path.parse(result.recordingsPath).root;
+      if (!dirsByDisk.has(diskRoot)) {
+        const targetFreeGB = minFreeSpaceGB * (1 + bufferPercentage / 100);
+        const spaceToFreeGB = targetFreeGB - result.spaceInfo.freeGB;
+        dirsByDisk.set(diskRoot, { dirs: [], spaceToFreeGB, spaceInfo: result.spaceInfo });
+      }
+      dirsByDisk.get(diskRoot).dirs.push(...result.dirsToDelete);
+    }
+
+    /**
+     * @type {{ path: string; sizeGB: number; mtime: number; }[]}
+     */
+    const allDirsToDelete = [];
+    for (const [diskRoot, { dirs, spaceToFreeGB }] of dirsByDisk.entries()) {
+      console.log(`为磁盘 ${diskRoot} 整合删除列表...`);
+      const sortedDirs = dirs.sort((/** @type {{ mtime: number; }} */ a, /** @type {{ mtime: number; }} */ b) => a.mtime - b.mtime);
+      let freedSpace = 0;
+      const dirsToDeleteForThisDisk = [];
+      for (const dir of sortedDirs) {
+        if (freedSpace < spaceToFreeGB) {
+          dirsToDeleteForThisDisk.push(dir);
+          freedSpace += dir.sizeGB;
+        } else {
+          break;
+        }
+      }
+      console.log(`磁盘 ${diskRoot} 计划删除 ${dirsToDeleteForThisDisk.length} 个目录，释放约 ${freedSpace.toFixed(2)}GB`);
+      allDirsToDelete.push(...dirsToDeleteForThisDisk);
+    }
+
+    if (allDirsToDelete.length > 0) {
+      const consolidatedEmailContent = emailSender.prepareConsolidatedDeleteEmail(triggeredResults, allDirsToDelete, minFreeSpaceGB, deleteDelay);
+      await emailSender.sendEmail('磁盘空间不足警告 (整合)', consolidatedEmailContent);
+      console.log(`已发送整合邮件通知，将在 ${deleteDelay} 小时后执行删除操作`);
+
+      isDeletionScheduled = true; // Set the flag
+      setTimeout(async () => {
+        console.log('开始执行整合删除操作...');
+        const deletedDirs = await fileManager.deleteDirectories(allDirsToDelete);
+        console.log('整合删除操作完成');
+
+        const postDeletionSpaceChecks = [];
+        const postDeleteDiskCache = new Map();
+
+        for (const result of triggeredResults) {
+          const diskRoot = path.parse(result.recordingsPath).root;
+          let postDeleteSpaceInfo;
+          if (postDeleteDiskCache.has(diskRoot)) {
+            postDeleteSpaceInfo = postDeleteDiskCache.get(diskRoot);
+          } else {
+            postDeleteSpaceInfo = await diskManager.getDiskSpace(result.recordingsPath);
+            postDeleteDiskCache.set(diskRoot, postDeleteSpaceInfo);
+          }
+
+          postDeletionSpaceChecks.push({
+            path: result.recordingsPath,
+            spaceInfo: postDeleteSpaceInfo
+          });
+        }
+
+        const consolidatedCompletionEmailContent = emailSender.prepareConsolidatedCompletionEmail(deletedDirs, postDeletionSpaceChecks);
+        await emailSender.sendEmail('自动删除完成通知 (整合)', consolidatedCompletionEmailContent);
+
+        isDeletionScheduled = false; // Reset the flag
+      }, deleteDelay * 60 * 60 * 1000); // 转换为毫秒
+
+    } else {
+      console.log('所有监控路径磁盘空间充足，无需操作');
+    }
   }
 }
 
